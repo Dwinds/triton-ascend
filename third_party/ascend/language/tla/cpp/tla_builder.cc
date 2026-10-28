@@ -136,6 +136,43 @@ Value createReshapeOp(TLABuilder &self, Value source, Type resultType,
       .getResult();
 }
 
+// Mode-aware lowering shared by the SIMD value ops that expose
+// MODE_ZEROING / MODE_MERGING (simd.py).  AVE regbase value ops have no
+// mutable dst operand, so "merging" cannot be CANN's dst-preserving predicate.
+// The TLA contract defines the merge source as the same-typed +0 SSA vector:
+//   * "zeroing": return the op result unchanged; these intrinsics already
+//     read inactive lanes as zero.
+//   * "merging": materialize that +0 vector (arith.constant zero +
+//     ave.hir.scalar_broadcast) and select it for the inactive lanes with
+//     ave.hir.vsel.  The mode is consumed here, producing a visible
+//     zero-init + merge combination rather than an unconsumed attribute.
+// Python passes the normalized mode string; an unknown spelling is rejected
+// instead of silently degrading to zeroing.
+Value applySimdMode(TLABuilder &self, Value result, Value mask,
+                    const std::string &mode) {
+  if (mode == "zeroing")
+    return result;
+  if (mode != "merging")
+    throw std::invalid_argument("unknown simd mode \"" + mode +
+                                "\"; expected \"zeroing\" or \"merging\"");
+  auto &builder = self.getBuilder();
+  auto loc = self.getLastLoc();
+  auto vecTy = cast<VectorType>(result.getType());
+  auto elemTy = vecTy.getElementType();
+  Value zeroScalar;
+  if (isa<IntegerType>(elemTy)) {
+    zeroScalar = builder.create<arith::ConstantOp>(
+        loc, IntegerAttr::get(elemTy, 0));
+  } else {
+    zeroScalar = builder.create<arith::ConstantOp>(
+        loc, FloatAttr::get(elemTy, 0.0));
+  }
+  Value zeroVector =
+      self.create<hivmave::VFBroadcastScalarOp>(vecTy, zeroScalar).getResult();
+  return self.create<hivmave::VFSelectOp>(vecTy, mask, result, zeroVector)
+      .getResult();
+}
+
 } // namespace
 
 void init_tla_builder(py::module &&m) {
@@ -196,39 +233,86 @@ void init_tla_builder(py::module &&m) {
       .def(
           "create_simd_binary",
           [](TLABuilder &self, std::string &kind, Value &lhs, Value &rhs,
-             Value &mask) -> Value {
+             Value &mask, std::string mode) -> Value {
             auto resTy = lhs.getType();
+            Value result;
             if (kind == "mul") {
-              return self.create<hivmave::VFMulOp>(resTy, lhs, rhs, mask)
-                  .getResult();
+              result = self.create<hivmave::VFMulOp>(resTy, lhs, rhs, mask)
+                           .getResult();
+            } else if (kind == "add") {
+              result = self.create<hivmave::VFAddOp>(resTy, lhs, rhs, mask)
+                           .getResult();
+            } else if (kind == "div") {
+              result = self.create<hivmave::VFDivOp>(resTy, lhs, rhs, mask)
+                           .getResult();
+            } else if (kind == "divfhp") {
+              // f32 precision='exact' / 'vdiv_0ulp_ftz_true': the real
+              // high-precision AVE division (ave.hir.vdivfhp).  Its pinned
+              // regbase lowering (vdiv_float_hp) is TileLang's
+              // vdiv_0ulp_ftz_true 0ULP sequence.  The caller mask is passed
+              // straight through; Python rejects non-f32 before this point
+              // because the library wrapper only has a float overload.
+              result =
+                  self.create<hivmave::VFDivFHPOp>(resTy, lhs, rhs, mask)
+                      .getResult();
+            } else if (kind == "xor") {
+              result = self.create<hivmave::VFXorOp>(resTy, lhs, rhs, mask)
+                           .getResult();
+            } else if (kind == "mod") {
+              result = self.create<hivmave::VFModOp>(resTy, lhs, rhs, mask)
+                           .getResult();
+            } else if (kind == "max") {
+              result = self.create<hivmave::VFMaxOp>(resTy, lhs, rhs, mask)
+                           .getResult();
+            } else if (kind == "min") {
+              result = self.create<hivmave::VFMinOp>(resTy, lhs, rhs, mask)
+                           .getResult();
+            } else if (kind == "umax") {
+              // Unsigned integer variants.  MLIR integers are signless, so
+              // the frontend's signedness cannot live in the element type;
+              // unsigned comparison/division needs its own AVE op (lib name
+              // ..._uintN) or, for vdiv, the `cast` attribute.
+              result = self.create<hivmave::VMaxUIOp>(resTy, lhs, rhs, mask)
+                           .getResult();
+            } else if (kind == "umin") {
+              result = self.create<hivmave::VMinUIOp>(resTy, lhs, rhs, mask)
+                           .getResult();
+            } else if (kind == "divu") {
+              auto op = self.create<hivmave::VFDivOp>(resTy, lhs, rhs, mask);
+              // ODS generates setCast(hivm::TypeFn) for the enum attribute.
+              op.setCast(hivm::TypeFn::cast_unsigned);
+              result = op.getResult();
+            } else {
+              throw std::invalid_argument("unknown binary kind: " + kind);
             }
-            if (kind == "add") {
-              return self.create<hivmave::VFAddOp>(resTy, lhs, rhs, mask)
-                  .getResult();
-            }
-            if (kind == "div") {
-              return self.create<hivmave::VFDivOp>(resTy, lhs, rhs, mask)
-                  .getResult();
-            }
-            if (kind == "xor") {
-              return self.create<hivmave::VFXorOp>(resTy, lhs, rhs, mask)
-                  .getResult();
-            }
-            if (kind == "mod") {
-              return self.create<hivmave::VFModOp>(resTy, lhs, rhs, mask)
-                  .getResult();
-            }
-            if (kind == "max") {
-              return self.create<hivmave::VFMaxOp>(resTy, lhs, rhs, mask)
-                  .getResult();
-            }
-            if (kind == "min") {
-              return self.create<hivmave::VFMinOp>(resTy, lhs, rhs, mask)
-                  .getResult();
-            }
-            throw std::invalid_argument("unknown binary kind: " + kind);
+            return applySimdMode(self, result, mask, mode);
           },
-          py::arg("kind"), py::arg("lhs"), py::arg("rhs"), py::arg("mask"))
+          py::arg("kind"), py::arg("lhs"), py::arg("rhs"), py::arg("mask"),
+          py::arg("mode") = "zeroing")
+      // Elementwise vector-scalar (``ave.hir.vmaxs`` / ``ave.hir.vsmaxs`` /
+      // ``ave.hir.vumaxs``): the scalar operand must have exactly the vector's
+      // element type (AVE_VecScalarOp::TypesMatchWith), so the Python frontend
+      // materializes it with create_simd_scalar[_int] first.
+      .def(
+          "create_simd_binary_scalar",
+          [](TLABuilder &self, std::string &kind, Value &vec, Value &scalar,
+             Value &mask, std::string mode) -> Value {
+            auto resTy = vec.getType();
+            Value result;
+            if (kind == "maxs") {
+              result = self.create<hivmave::VFMaxsOp>(resTy, vec, scalar, mask)
+                           .getResult();
+            } else if (kind == "umaxs") {
+              result = self.create<hivmave::VMaxsUIOp>(resTy, vec, scalar, mask)
+                           .getResult();
+            } else {
+              throw std::invalid_argument("unknown vector-scalar kind: " +
+                                          kind);
+            }
+            return applySimdMode(self, result, mask, mode);
+          },
+          py::arg("kind"), py::arg("vec"), py::arg("scalar"),
+          py::arg("mask"), py::arg("mode") = "zeroing")
       .def(
           "create_simd_vfma",
           [](TLABuilder &self, Value &acc, Value &lhs, Value &rhs,
@@ -242,24 +326,29 @@ void init_tla_builder(py::module &&m) {
           py::arg("acc"), py::arg("lhs"), py::arg("rhs"), py::arg("mask"))
       .def(
           "create_simd_unary",
-          [](TLABuilder &self, std::string &kind, Value &src,
-             Value &mask) -> Value {
+          [](TLABuilder &self, std::string &kind, Value &src, Value &mask,
+             std::string mode) -> Value {
             auto resTy = src.getType();
+            Value result;
             if (kind == "neg") {
-              return self.create<hivmave::VFNegOp>(resTy, src, mask)
-                  .getResult();
+              result = self.create<hivmave::VFNegOp>(resTy, src, mask)
+                           .getResult();
+            } else if (kind == "sqrt") {
+              result = self.create<hivmave::VFSqrtOp>(resTy, src, mask)
+                           .getResult();
+            } else if (kind == "rsqrt") {
+              result = self.create<hivmave::VFRsqrtOp>(resTy, src, mask)
+                           .getResult();
+            } else if (kind == "exp") {
+              result = self.create<hivmave::VFExpOp>(resTy, src, mask)
+                           .getResult();
+            } else {
+              throw std::invalid_argument("unknown unary kind: " + kind);
             }
-            if (kind == "sqrt") {
-              return self.create<hivmave::VFSqrtOp>(resTy, src, mask)
-                  .getResult();
-            }
-            if (kind == "rsqrt") {
-              return self.create<hivmave::VFRsqrtOp>(resTy, src, mask)
-                  .getResult();
-            }
-            throw std::invalid_argument("unknown unary kind: " + kind);
+            return applySimdMode(self, result, mask, mode);
           },
-          py::arg("kind"), py::arg("src"), py::arg("mask"))
+          py::arg("kind"), py::arg("src"), py::arg("mask"),
+          py::arg("mode") = "zeroing")
       .def(
           "create_simd_vreduce",
           [](TLABuilder &self, Value &vector, Value &mask,
@@ -314,14 +403,16 @@ void init_tla_builder(py::module &&m) {
           py::arg("cmp"), py::arg("lhs"), py::arg("rhs"), py::arg("mask"))
       .def(
           "create_simd_vbroadcast",
-          [](TLABuilder &self, Value &src, Value &mask, bool low) -> Value {
+          [](TLABuilder &self, Value &src, Value &mask, bool low,
+             std::string mode) -> Value {
             auto &builder = self.getBuilder();
             auto resTy = src.getType();
             auto op = self.create<hivmave::VFBroadcastVectorOp>(
                 resTy, src, mask, builder.getBoolAttr(low));
-            return op.getResult();
+            return applySimdMode(self, op.getResult(), mask, mode);
           },
-          py::arg("src"), py::arg("mask"), py::arg("low"))
+          py::arg("src"), py::arg("mask"), py::arg("low"),
+          py::arg("mode") = "zeroing")
       .def(
           "create_simd_vmembar",
           [](TLABuilder &self, std::string &scope) {
@@ -374,6 +465,41 @@ void init_tla_builder(py::module &&m) {
             return op.getResult();
           },
           py::arg("scalar"), py::arg("elem_tag"), py::arg("lanes"))
+      // Exact integer scalar.  create_simd_scalar() takes a python double and
+      // static_casts it, which silently rounds integers above 2**53; integer
+      // consumers (vdup / vmaxs on i64) must route through this binding.
+      .def(
+          "create_simd_scalar_int",
+          [](TLABuilder &self, py::object elem_tag, int64_t value) -> Value {
+            auto &builder = self.getBuilder();
+            auto *ctx = builder.getContext();
+            auto loc = self.getLastLoc();
+            auto elemTy = resolveSimdElementType(ctx, elem_tag);
+            if (!isa<IntegerType>(elemTy)) {
+              throw std::invalid_argument(
+                  "create_simd_scalar_int requires an integer element tag");
+            }
+            return builder.create<arith::ConstantOp>(
+                loc, IntegerAttr::get(elemTy, value));
+          },
+          py::arg("elem_tag"), py::arg("value"))
+      // Masked scalar broadcast (``ave.hir.broadcast``, lib
+      // _mlir_ciface_vdups_<dtype>).  This is deliberately *not* vsplat():
+      // scalar_broadcast ignores the predicate.
+      .def(
+          "create_simd_vdup",
+          [](TLABuilder &self, Value &scalar, py::object elem_tag,
+             int32_t lanes, Value &mask, std::string mode) -> Value {
+            auto &builder = self.getBuilder();
+            auto *ctx = builder.getContext();
+            auto elemTy = resolveSimdElementType(ctx, elem_tag);
+            auto vecTy = VectorType::get({lanes}, elemTy);
+            auto op = self.create<hivmave::VFBroadcastScalarMaskOp>(
+                vecTy, scalar, mask);
+            return applySimdMode(self, op.getResult(), mask, mode);
+          },
+          py::arg("scalar"), py::arg("elem_tag"), py::arg("lanes"),
+          py::arg("mask"), py::arg("mode") = "zeroing")
       .def(
           "create_simd_vcvt",
           [](TLABuilder &self, std::string &kind, Value &src, Value &mask,
