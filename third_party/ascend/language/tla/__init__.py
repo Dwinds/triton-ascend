@@ -70,7 +70,7 @@ from .dma import (
     set_ctrl,
 )
 from .view import view, reshape
-from .aux_ops import annotate_buffer_versions
+from .aux_ops import annotate_buffer_versions, assume
 from . import math
 from .math import compensated_rstd, sqrt, truncmod
 from .debug import device_assert, device_print
@@ -158,6 +158,7 @@ __all__ = [
 
     # aux ops
     "annotate_buffer_versions",
+    "assume",
 
     # simd ops
     "simd",
