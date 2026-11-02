@@ -72,7 +72,7 @@ from .dma import (
 from .view import view, reshape
 from .aux_ops import annotate_buffer_versions
 from . import math
-from .math import compensated_rstd, sqrt
+from .math import compensated_rstd, sqrt, truncmod
 from .debug import device_assert, device_print
 
 # SIMD vector-register ops.  ``simd`` is exported as a module so its ``cast``
@@ -152,6 +152,7 @@ __all__ = [
     "math",
     "compensated_rstd",
     "sqrt",
+    "truncmod",
     "device_assert",
     "device_print",
 
