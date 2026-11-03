@@ -141,7 +141,12 @@ def test_sqrt_ir(output_dir=None):
         module, ctx = compile_offline(kernel, signature, {}, output_dir)
         text = str(module)
         assert ("math.sqrt" if kernel is _scalar_sqrt else "ave.hir.vsqrt") in text, text
-        lower_offline(module, ctx, output_dir)
+        lowered = str(lower_offline(module, ctx, output_dir))
+        if kernel is _scalar_sqrt:
+            assert "math.sqrt" in lowered, lowered
+            assert "tensor<" not in lowered, lowered
+        else:
+            assert "ave.hir.vsqrt" in lowered, lowered
 
 
 def test_scalar_where_ir(output_dir=None):
