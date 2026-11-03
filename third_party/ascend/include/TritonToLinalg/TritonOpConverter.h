@@ -32,6 +32,8 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -139,6 +141,16 @@ public:
       return rewriter.notifyMatchFailure(
           op,
           "ScalarMathCanonicalizer handles op not within tt.map_elementwise.");
+    }
+    // The TLA affinity pipeline lowers scalar f32 sqrt directly to LLVM;
+    // it cannot consume the tensor.insert introduced by this promotion.
+    if (isa<math::SqrtOp>(op.getOperation()) &&
+        op->getResult(0).getType().isF32()) {
+      if (auto moduleOp = op->template getParentOfType<ModuleOp>()) {
+        auto mode = moduleOp->template getAttrOfType<StringAttr>("hacc.mode");
+        if (mode && mode.getValue() == "tla")
+          return rewriter.notifyMatchFailure(op, "TLA keeps f32 sqrt scalar");
+      }
     }
     auto loc = op.getLoc();
     llvm::SmallVector<Value> inputs;

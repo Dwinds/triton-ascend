@@ -244,6 +244,7 @@ def ast_to_ttir(fn, signature, constexprs, context, options, module=None):
     if arch:
         builder = ascend_ir.ascendnpu_ir_builder(context, arch)
         module.set_attr("hacc.target", builder.parse_attr(f'#hacc.target<"{arch}">'))
+    _stamp_tla_mode(module)
     if not module.verify():
         raise RuntimeError("TLA module verification failed")
     return module
